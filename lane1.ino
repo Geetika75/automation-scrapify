@@ -882,6 +882,7 @@ void loop() {
             float h = readHeadingDeg();
             bool reached = false;
             bool failed  = false;
+            float err    = 0.0f;
 
             // Reject a reading that implies an impossible jump since the last
             // ACCEPTED reading (e.g. a lone "0.00" glitch from I2C/EMI noise
@@ -904,7 +905,7 @@ void loop() {
                 compassFailStreak = 0;
                 lastCompassHeadingDeg  = h;
                 lastGoodTurnHeadingDeg = h;
-                float err = headingDiffDeg(h, compassTargetHeading);
+                err = headingDiffDeg(h, compassTargetHeading);
                 BLOGf("[CTURN] heading=%.1f  target=%.1f  err=%.1f  mode=%s\r\n",
                       h, compassTargetHeading, err, compassNearMode ? "NEAR" : "FAR");
 
