@@ -928,12 +928,13 @@ void loop() {
                     h = -1.0f;   // fall through to the failed-read branch below
                 }
             }
+            float err = 0.0f;
 
             if (h >= 0.0f) {
                 compassFailStreak = 0;
                 lastCompassHeadingDeg  = h;
                 lastGoodTurnHeadingDeg = h;
-                float err = headingDiffDeg(h, compassTargetHeading);
+                err = headingDiffDeg(h, compassTargetHeading);
                 BLOGf("[CTURN] heading=%.1f  target=%.1f  err=%.1f  mode=%s\r\n",
                       h, compassTargetHeading, err, compassNearMode ? "NEAR" : "FAR");
 
