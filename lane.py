@@ -2216,8 +2216,15 @@ def main():
                                 # with no heading correction at all).
                                 _sp_move(SEARCH_LANE_SHIFT_M, f"lane-shift-{lane_index}-move", centre_corrected=True)
 
-                                # Turn 90deg again so the boat faces down the new lane.
-                                _sp_turn(shift_angle, f"lane-shift-{lane_index}-turn2-{shift_label}")
+                                # Turn 90deg again to face down the new lane. Target the
+                                # absolute heading derived from lheading, not a relative
+                                # turn from wherever the move left the boat pointing —
+                                # CMOVE only corrects heading once before the move starts,
+                                # so any drift during the move must not carry into the
+                                # new lane's centre.
+                                turn2_label = f"lane-shift-{lane_index}-turn2-{shift_label}"
+                                if lheading is None or not _sp_turn_to((lheading + shift_angle) % 360.0, turn2_label):
+                                    _sp_turn(shift_angle, turn2_label)
 
                                 # Note the new lane's forward heading (cheading) —
                                 # this is the first point of the new lane, and the
