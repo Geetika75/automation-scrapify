@@ -2291,7 +2291,7 @@ def main():
                     scan_busy = True
                     threading.Thread(target=scan_step, daemon=True).start()
 
-        # -- Draw ----------------------------------------------------------
+        # -- Draww ----------------------------------------------------------
         with _nav_lock:
             _active_id_draw = active_id
         ann_l = draw_detections(
