@@ -181,6 +181,10 @@ SCAN_EDGE_DEG          = 90.0   # deg — scan-dance return-to-centre turn & lan
 COLLECT_MAX_DIST_M     = STEP_DISTANCE_M   # m — 0.5m: collect if <=, else ignore
 SEARCH_SETTLE_S        = 0.4    # s   — pause after each sub-step to check for targets (was 0.8s)
 SCAN_EDGE_VERIFY_TOL_DEG = 5.0   # deg — tolerance for the return-to-centre heading check
+SCAN_STEP_COARSE_TOL_DEG = 12.0  # deg — widened accept tolerance for the first two 30deg
+                                 # splits per side; skips the ESP's reach-verify coast-settle
+                                 # since these don't need to be exact — the final split to
+                                 # the edge (an absolute-target turn) corrects any drift
 
 
 def heading_diff_deg(frm, to):
@@ -439,9 +443,15 @@ class ESPCommander:
         print(f"  -> CTurn {direction}  {abs(angle_deg):.1f}deg (compass)")
         self._send_and_wait(cmd)
 
-    def send_turn_compass_interruptible(self, angle_deg, interrupt_event):
-        """Compass-verified turn that can be interrupted mid-execution."""
-        cmd       = f"CMD:CTURN {angle_deg:.1f}"
+    def send_turn_compass_interruptible(self, angle_deg, interrupt_event, tol_deg=None):
+        """Compass-verified turn that can be interrupted mid-execution.
+
+        tol_deg, if given, is passed to the ESP as a widened accept
+        tolerance (CMD:CTURN <deg> <tol>). Above the ESP's default
+        COMPASS_TURN_TOL_DEG this skips its reach-verify coast-settle,
+        so intermediate stops don't need to nail an exact heading."""
+        cmd = (f"CMD:CTURN {angle_deg:.1f} {tol_deg:.1f}"
+               if tol_deg is not None else f"CMD:CTURN {angle_deg:.1f}")
         direction = "left" if angle_deg < 0 else "right"
         print(f"  -> CScan {direction}  {abs(angle_deg):.1f}deg (compass)")
         return self._send_and_wait(cmd,
@@ -1997,7 +2007,7 @@ def main():
                                 else:
                                     break
 
-                        def _sp_turn(angle_deg, label):
+                        def _sp_turn(angle_deg, label, tol_deg=None):
                             """Compass-verified, interruptible turn. If a
                             collection interrupt fires before or during the
                             turn, pause for collection then retry toward the
@@ -2009,7 +2019,12 @@ def main():
                             accumulate that drift PLUS a full fresh angle_deg
                             every time it gets interrupted, which is exactly
                             what the scan-dance edge double-check is there
-                            to catch (and did)."""
+                            to catch (and did).
+
+                            tol_deg, if given, widens the ESP's accept
+                            tolerance so it skips its reach-verify coast-settle
+                            — used for intermediate splits that don't need to
+                            be exact."""
                             absolute_target = None
                             remaining_delta = angle_deg
                             while True:
@@ -2029,7 +2044,7 @@ def main():
                                     if cur is not None:
                                         absolute_target = (cur + angle_deg) % 360.0
                                 completed = esp.send_turn_compass_interruptible(
-                                    remaining_delta, nav_interrupt_event)
+                                    remaining_delta, nav_interrupt_event, tol_deg=tol_deg)
                                 if not completed or nav_interrupt_event.is_set():
                                     _sp_pause_for_collection(f"{label} (interrupted)")
                                     if absolute_target is not None:
@@ -2120,24 +2135,13 @@ def main():
 
 
                         def _scan_dance(label):
-                            """Note the centre heading (cheading), then:
-                              - 3x+30 out right (stop & look each step)
-                              - single full 90deg turn back to centre, then
-                                verify the achieved heading against cheading
-                                and stabilise (settle already happens inside
-                                _sp_turn_to's _sp_wait)
-                              - 3x-30 out left (stop & look each step)
-                              - single full 90deg turn back to centre, then
-                                verify against cheading and stabilise
-                            Every CMD:CTURN delta is relative to whatever the
-                            ESP reads as the CURRENT heading at call time, so
-                            no absolute/negative bookkeeping is needed here —
-                            the firmware's fmod(...,360) wrap handles it. The
-                            return-to-centre leg targets the noted ABSOLUTE
-                            cheading via _sp_turn_to (a single compass turn,
-                            not a further 3-way split), falling back to a
-                            blind relative 90deg turn only if GETHEADING
-                            fails."""
+                            """Note the centre heading (cheading), then per side:
+                              - 2x coarse 30deg splits out (no reach-verify —
+                                these don't need to be exact)
+                              - one precise turn to the absolute cheading+-90
+                                edge, correcting any drift from the two splits
+                              - one precise turn back to cheading, verified
+                            """
                             print(f"  [search] scan-dance @ {label}")
                             center_heading = esp.get_heading()
                             if center_heading is not None:
@@ -2145,19 +2149,29 @@ def main():
                                       f"{center_heading:.1f}deg")
                             else:
                                 print(f"  [search] {label}: could not note cheading "
-                                      f"(GETHEADING failed) — return-to-centre check "
-                                      f"will be skipped for this stop")
+                                      f"(GETHEADING failed) — edge/return-to-centre "
+                                      f"checks will be skipped for this stop")
 
-                            # Right: 3x30deg split turns out, then one full 90deg turn back
-                            for i in range(3):
-                                _sp_turn(+SCAN_STEP_DEG, f"{label} right-step-{i+1}/3")
+                            # Right side
+                            _sp_turn(+SCAN_STEP_DEG, f"{label} right-step-1/3",
+                                     tol_deg=SCAN_STEP_COARSE_TOL_DEG)
+                            _sp_turn(+SCAN_STEP_DEG, f"{label} right-step-2/3",
+                                     tol_deg=SCAN_STEP_COARSE_TOL_DEG)
+                            if center_heading is None or not _sp_turn_to(
+                                    (center_heading + SCAN_EDGE_DEG) % 360.0, f"{label} right-edge"):
+                                _sp_turn(+SCAN_STEP_DEG, f"{label} right-step-3/3")
                             if center_heading is None or not _sp_turn_to(center_heading, f"{label} return-to-center-from-right"):
                                 _sp_turn(-SCAN_EDGE_DEG, f"{label} return-to-center-from-right")
                             _sp_verify_center(f"{label} right-return", center_heading)
 
-                            # Left: 3x30deg split turns out, then one full 90deg turn back
-                            for i in range(3):
-                                _sp_turn(-SCAN_STEP_DEG, f"{label} left-step-{i+1}/3")
+                            # Left side
+                            _sp_turn(-SCAN_STEP_DEG, f"{label} left-step-1/3",
+                                     tol_deg=SCAN_STEP_COARSE_TOL_DEG)
+                            _sp_turn(-SCAN_STEP_DEG, f"{label} left-step-2/3",
+                                     tol_deg=SCAN_STEP_COARSE_TOL_DEG)
+                            if center_heading is None or not _sp_turn_to(
+                                    (center_heading - SCAN_EDGE_DEG) % 360.0, f"{label} left-edge"):
+                                _sp_turn(-SCAN_STEP_DEG, f"{label} left-step-3/3")
                             if center_heading is None or not _sp_turn_to(center_heading, f"{label} return-to-center-from-left"):
                                 _sp_turn(+SCAN_EDGE_DEG, f"{label} return-to-center-from-left")
                             _sp_verify_center(f"{label} left-return", center_heading)
@@ -2291,7 +2305,7 @@ def main():
                     scan_busy = True
                     threading.Thread(target=scan_step, daemon=True).start()
 
-        # -- Draww ----------------------------------------------------------
+        # -- Draw ----------------------------------------------------------
         with _nav_lock:
             _active_id_draw = active_id
         ann_l = draw_detections(

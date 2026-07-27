@@ -1,84 +1,38 @@
 /*
  * esp32_waterbot.ino
- * ──────────────────────────────────────────────────────────────────────────
  * Water-surface waste-collection bot — ESP32-WROOM-32 firmware
- * [UPDATED: Non-blocking motion + Explicit ledcAttach v3.x API]
- * [FIX: Non-blocking settle, priority CMD:STOP, double-DONE prevention]
- * [NEO 3 / IST8310: compass-verified closed-loop turns for scan commands]
  *
- * [FIX — POLARITY] Compass turns were driving the motors backwards relative
- * to the heading convention: commanding deltaDeg > 0 ("clockwise", heading
- * should INCREASE) was actually spinning the boat the other way, so the
- * heading DECREASED every poll. Combined with the reactive per-poll
- * direction-flip (see next fix), this meant the error only ever grew,
- * wrapped past 0/360, and the correction chased itself around the far side
- * of the compass rose until the 8s timeout. Motor direction for CMD:CTURN
- * is now swapped so deltaDeg > 0 genuinely increases heading.
+ * Fix history:
+ * - Polarity: CMD:CTURN deltaDeg > 0 now genuinely increases heading
+ *   (driveCompassDir was mapped backwards).
+ * - Turn direction is chosen once at the start of a compass turn and held
+ *   for the FAR (full-speed) phase; NEAR-mode pulses recompute direction
+ *   from the live error each cycle, since FAR-mode momentum can carry the
+ *   hull past target before the stop takes effect.
+ * - "Reached" is provisional: any reach event (FAR or NEAR) stops the
+ *   motors immediately but isn't finalized until an extra coast-settle
+ *   window (COMPASS_REACHED_VERIFY_MS) confirms the heading actually held.
+ *   Momentum was carrying the hull a few to twenty-plus degrees past
+ *   target before the old fixed 150ms settle read it.
+ * - The one-shot compass read at settle-complete now goes through the same
+ *   plausibility check as in-turn polls, since the first read right after
+ *   enableI2C()'s re-setup is often a glitchy 0.00.
+ * - CMD:CMOVE now steers continuously: I2C stays enabled through the whole
+ *   move, and a proportional differential correction (CMOVE_STEER_KP,
+ *   capped at CMOVE_STEER_MAX_CORR) keeps the boat on the held centre
+ *   heading the entire time. Replaces an earlier stop-every-0.25m-and-turn
+ *   approach that let drift build up between checkpoints and looked like
+ *   the boat veering off course before each correction.
  *
- * [FIX — NO MORE REACTIVE DIRECTION FLIP, EXCEPT IN NEAR MODE] Direction is
- * chosen ONCE in doTurnCompass() from the sign of deltaDeg and held fixed for
- * the whole FAR-mode (full-speed) phase — see compassTurnDir. FAR-mode
- * momentum can carry the hull past the target before the motor stop takes
- * effect though, so once in NEAR mode (short pulse/brake cycles) the pulse
- * direction IS recomputed each cycle from the live sign of err. This is safe
- * now that driveCompassDir()'s polarity itself is corrected — the old bug
- * this comment used to warn about was direction-flipping combined with
- * BACKWARDS polarity, which chased itself around the compass forever.
- * The final approach (within COMPASS_NEAR_THRESHOLD_DEG) uses short
- * full-stop-then-pulse cycles at a speed strong enough to actually move the
- * boat (COMPASS_NEAR_SPEED). Pulse duration is now adaptive
- * (compassPulseDurMs): it lengthens when a pulse makes negligible progress
- * against water drag/slosh, and resets to the base duration once progress
- * resumes, instead of a single fixed 150ms that could stall indefinitely.
+ * CUAV NEO 3 (IST8310 compass) wiring: I2C only (SDA/SCL), GPS UART unused.
+ *   NEO 3 SDA -> ESP32 GPIO21   NEO 3 SCL -> ESP32 GPIO22
+ *   NEO 3 VCC -> 3.3V           NEO 3 GND -> GND
+ *   Requires the IST8310 Arduino library (Wire-based).
  *
- * [FIX — FAR-MODE "REACHED" COULD BE A MOMENTUM ILLUSION] A single 250ms FAR
- * poll can, on a fast boat, jump the heading by 20+ deg — occasionally
- * landing directly inside COMPASS_TURN_TOL_DEG without ever slowing into
- * NEAR mode. motorsStop() was fired immediately and the turn reported DONE,
- * but at full FAR speed the hull keeps coasting well past that point before
- * it actually stops. NEAR-mode pulses can also leave a few degrees of
- * residual coast during STOP_SETTLE_MS, which showed up as right turns
- * undershooting and left turns overshooting by a few degrees. Every
- * "reached" event is now provisional: motors stop immediately, but the turn
- * is not finalized until an extra coast-settle window
- * (COMPASS_REACHED_VERIFY_MS) has passed and a fresh reading confirms the
- * hull actually settled within tolerance. If it coasted past, the turn
- * resumes closed-loop instead of reporting a false DONE.
- *
- * [FIX — UNCHECKED FINAL SETTLE READ] The one-shot compass read taken at
- * settle-complete (used for the "DONE HEADING=xx.x" report) had no
- * plausibility check, unlike every in-turn poll. In practice the first read
- * right after enableI2C()'s re-setup is frequently a glitchy 0.00 (I2C not
- * fully settled yet), which was being reported to the Jetson as a real
- * heading. This read now goes through the same
- * COMPASS_MAX_PLAUSIBLE_JUMP_DEG check as in-turn polls, falling back to the
- * last known good heading instead of reporting a glitch as fact.
- *
- * [FIX — CMOVE DID NOT CORRECT DURING THE MOVE] CMD:CMOVE only checked
- * heading once before starting; the actual drive was open-loop with I2C
- * disabled (to avoid motor EMI on the bus), so a motor imbalance could
- * drift the heading freely for the whole move with no correction at all.
- * CMD:CMOVE now walks the distance in short segments (CMOVE_SEGMENT_M),
- * pausing briefly between each to re-enable I2C, recheck heading against
- * the held target, and issue a compass-turn correction if it drifted
- * beyond CENTRE_CORRECT_TOL_DEG before continuing.
- *
- * ── CUAV NEO 3 (IST8310 compass) wiring ─────────────────────────────────
- *   Only the I2C lines are used (SDA/SCL) to read heading from the IST8310
- *   magnetometer on the NEO 3 module. The GPS UART (RX/TX) is NOT used.
- *     NEO 3 SDA -> ESP32 GPIO21
- *     NEO 3 SCL -> ESP32 GPIO22
- *     NEO 3 VCC -> 3.3V   NEO 3 GND -> GND
- *   Requires the IST8310 Arduino library (Wire-based), e.g.
- *   https://github.com/dayaftereh/rocket
- *
- * ── Jetson-side "Stepped Serpentine" search pattern ─────────────────────
- *   The Jetson's search_pattern() / _scan_dance() / lane-shift logic only
- *   ever issues CMD:CTURN (any signed angle — dance uses ±90/±30, lane
- *   shifts use ±90), CMD:CMOVE / CMD:MOVE (signed distance), CMD:SETCENTRE,
- *   CMD:GETHEADING, and CMD:STOP. No protocol changes were needed here for
- *   that; this file only needed the polarity, direction-flip, and
- *   reached-from-FAR / unchecked-settle-read fixes above.
+ * Protocol: CMD:TURN (timed, no compass), CMD:CTURN (compass-verified),
+ * CMD:MOVE (timed), CMD:CMOVE (compass-steered), CMD:SETCENTRE,
+ * CMD:GETHEADING, CMD:STOP. Replies: DONE, DONE HEADING=xx.x[ STALLED=1],
+ * HEADING:xx.x, HELLO.
  */
 
 #include <WiFi.h>
@@ -143,66 +97,56 @@ float MOVE_M_PER_SEC   = 0.1429;
 // ═══════════════════════════════════════════════════════════════════════════
 #define COMPASS_TURN_TOL_DEG          3.0f
 #define COMPASS_TURN_MAX_MS           10000UL // headroom for the near-mode pulse phase
-#define COMPASS_POLL_MIN_MS           250UL
+#define COMPASS_POLL_MIN_MS           80UL
 #define COMPASS_FAIL_ABORT_STREAK     15
 #define COMPASS_DISABLE_AFTER_N_FAILS 10
 
-// ── NEAR-target approach (replaces the reactive direction-flip) ────────────
-// COMPASS_NEAR_SPEED must be strong enough to actually move the boat once
-// it's this close — too weak (previously 145) and it just stalls in place.
+// NEAR-target approach: short stop-then-pulse cycles once within this
+// threshold, replacing the earlier reactive direction-flip.
 #define COMPASS_NEAR_THRESHOLD_DEG    20.0f
-#define COMPASS_NEAR_SPEED            190
-#define COMPASS_PULSE_MS              150UL
+#define COMPASS_NEAR_SPEED            165
+#define COMPASS_PULSE_MS              90UL
 #define COMPASS_PULSE_MS_MAX          400UL  // cap so a stalled pulse can't run away
 #define COMPASS_PULSE_PROGRESS_MIN    1.0f   // deg — below this, count as "stalled" vs drag
 #define COMPASS_BRAKE_MS              200UL
-// If NEAR-mode pulse direction flips sign this many cycles in a row, the hull
-// has enough momentum that pulses are overshooting the target both ways
-// (hunting), not just being soaked up by drag — growing the pulse further
-// would make that worse. Force a short, gentle "fine tap" instead.
+// If NEAR-mode pulse direction flips sign this many cycles running, the
+// hull is hunting past target both ways on momentum — force a short,
+// gentle "fine tap" instead of growing the pulse further.
 #define COMPASS_OSCILLATION_LIMIT     2
 #define COMPASS_PULSE_MS_FINE         80UL
-// At TURN_DEG_PER_SEC=77 and a 250ms poll, a genuine reading can't move more
-// than ~19-25deg between polls even at full FAR-mode speed. A reading that
-// implies a bigger jump than this (e.g. a lone "0.00" glitch from I2C/EMI
-// noise while the real heading was elsewhere) is almost certainly bad data,
-// not real motion — reject it like a failed read rather than trusting it and
-// spinning the boat an extra ~300deg chasing a phantom error.
+// A genuine reading can't move more than ~19-25deg between 250ms polls
+// even at full FAR speed. A bigger implied jump (e.g. an I2C/EMI glitch)
+// is almost certainly bad data, not real motion.
 #define COMPASS_MAX_PLAUSIBLE_JUMP_DEG 60.0f
 
-// Reach verification: any "reached" event (FAR or NEAR) stops the motors
-// immediately but doesn't finalize DONE until this coast-settle window
-// passes and a fresh read confirms the heading actually held. Momentum from
-// the last pulse/spin can still carry the hull a few degrees past target
-// even in NEAR mode, which was showing up as small right-undershoot /
-// left-overshoot on ordinary 30deg steps.
+// Any "reached" event is provisional: stop immediately, then wait this
+// long and recheck before finalizing, since momentum (FAR or NEAR mode)
+// can still carry the hull a few degrees past target.
 #define COMPASS_REACHED_VERIFY_MS  400UL
 
-// Centre-heading correction applied before every CMD:CMOVE.
-// The ESP reads the compass (median-of-3) when CMD:SETCENTRE arrives and
-// stores it as centreHeadingDeg. Before a CMD:CMOVE move starts, if the
-// current heading deviates by more than this from the stored centre, a
-// doTurnCompass() correction runs first in the same non-blocking state
-// machine — no extra TCP round-trips needed from the Jetson.
+// Centre-heading correction used by CMD:CMOVE's continuous steering.
 #define CENTRE_CORRECT_TOL_DEG        5.0f
 
-// ── Stall detection/escalation (e.g. a floor bump stopping the hull) ───────
 // FAR mode: expected minimum heading change between polls at full speed —
-// if progress stays below this several polls running, ramp PWM.
+// if progress stays below this several polls running, ramp PWM (handles a
+// floor/obstruction bump stalling the hull while the compass stays valid).
 #define FAR_STALL_PROGRESS_MIN_DEG    2.0f
 #define FAR_STALL_STREAK_LIMIT        3
 #define FAR_SPEED_STEP                15
 #define FAR_SPEED_MAX                 255
-// NEAR mode: once compassPulseDurMs is already maxed and still not making
+// NEAR mode: once pulse duration is already maxed and still not making
 // progress, ramp COMPASS_NEAR_SPEED instead of repeating useless pulses.
 #define NEAR_STALL_AT_CAP_LIMIT       3
 #define NEAR_SPEED_STEP               15
 #define NEAR_SPEED_MAX                255
 // Brief reverse pulse when fully stuck at max PWM in either mode — the one
-// deliberate blocking exception in this otherwise non-blocking file, kept
-// short and rare (only fires at max PWM with zero progress) so it shouldn't
-// meaningfully disrupt CMD:STOP responsiveness.
+// deliberate blocking exception here, kept short and rare.
 #define ROCK_FREE_MS                  250UL
+
+// CMD:CMOVE continuous steering.
+#define CMOVE_STEER_POLL_MS   200UL   // heading recheck interval while driving
+#define CMOVE_STEER_KP        3.0f    // deg error -> PWM differential
+#define CMOVE_STEER_MAX_CORR  50.0f   // cap so one side never stalls or reverses
 
 IST8310       ist8310;
 bool          compassReady = false;
@@ -224,7 +168,7 @@ WiFiClient client;
 String     cmdBuf = "";
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  MOTION STATE TRACKING
+//  MOTION STATE
 // ═══════════════════════════════════════════════════════════════════════════
 bool          isMoving      = false;
 bool          isSettling    = false;
@@ -237,14 +181,11 @@ unsigned long compassTurnTimeoutMs = 0;
 unsigned long lastCompassPollMs    = 0;
 
 // Last successfully-read compass heading, reported back to the Jetson
-// alongside DONE (as "DONE HEADING=xx.x") so the Jetson can verify actual
-// achieved headings (e.g. the 90 deg scan-dance edge check) instead of
-// only seeing bare completion acks. NAN until a first good read happens.
+// alongside DONE (as "DONE HEADING=xx.x"). NAN until a first good read.
 float         lastCompassHeadingDeg = NAN;
 
-// Direction chosen ONCE at the start of a turn, held fixed for its entire
-// duration — never recomputed from live error. +1 = the direction that
-// makes heading INCREASE (true clockwise), -1 = heading decreases.
+// Direction chosen once at the start of a turn, held fixed for the FAR
+// phase. +1 = heading increases (clockwise), -1 = heading decreases.
 int8_t        compassTurnDir       = 1;
 
 bool          compassNearMode      = false;
@@ -252,70 +193,53 @@ bool          compassPulsing       = false;
 bool          compassBraking       = false;
 unsigned long compassPhaseEndMs    = 0;
 
-// Adaptive NEAR-mode pulse duration: starts at COMPASS_PULSE_MS, grows (capped
-// at COMPASS_PULSE_MS_MAX) whenever a pulse fails to make real progress
-// against water drag, resets back to base once progress is seen again.
+// Adaptive NEAR-mode pulse duration: grows (capped) when a pulse makes no
+// real progress against water drag, resets once progress resumes.
 unsigned long compassPulseDurMs    = 0;
 float         compassHeadingBeforePulse = 0.0f;
 
-// Last ACCEPTED (plausible) heading during the current turn — used to reject
-// glitch readings that imply an impossible jump. Reset to the start heading
-// at the top of every doTurnCompass() call. NAN when no turn is in progress.
+// Last ACCEPTED (plausible) heading during the current turn, used to
+// reject glitch readings that imply an impossible jump.
 float         lastGoodTurnHeadingDeg = NAN;
 
-// Oscillation detection for NEAR mode: if the pulse direction flips sign
-// several cycles running, the hull is hunting back and forth past the
-// target on momentum rather than just being slowed by drag.
+// NEAR-mode oscillation tracking (pulse direction flip-flopping on momentum).
 int8_t        compassNearDirPrev        = 0;
 uint8_t       compassOscillationStreak  = 0;
 
-// ── FAR-mode stall detection (mirrors NEAR-mode's adaptive pulse approach) ──
-// A bump can stall the hull mid-turn while the compass reading stays
-// perfectly valid (it's a real heading, just not changing) — so this never
-// trips the bad-read/glitch-rejection paths above. Only tracking actual
-// progress between polls catches it.
-float         far_headingAtLastPoll = NAN;   // heading at the previous FAR-mode poll
-uint8_t       far_stallStreak       = 0;     // consecutive polls with no real progress
-uint8_t       currentFarSpeed       = SPEED_TURN;  // adaptive — starts at SPEED_TURN, ramps on stall
+// FAR-mode stall detection.
+float         far_headingAtLastPoll = NAN;
+uint8_t       far_stallStreak       = 0;
+uint8_t       currentFarSpeed       = SPEED_TURN;
 
-// ── NEAR-mode stall escalation (past the existing pulse-duration cap) ──────
-// compassPulseDurMs already grows on stalled progress, but caps at
-// COMPASS_PULSE_MS_MAX — if a bump is bigger than that pulse can push
-// through, it would otherwise just sit there pulsing uselessly forever.
-uint8_t       currentNearSpeed      = COMPASS_NEAR_SPEED;  // adaptive — starts at base, ramps on stall
-uint8_t       near_stallAtCapStreak = 0;     // consecutive maxed-out pulses with no progress
+// NEAR-mode stall escalation.
+uint8_t       currentNearSpeed      = COMPASS_NEAR_SPEED;
+uint8_t       near_stallAtCapStreak = 0;
 
-// Set anywhere a stall-escalation branch fires during this turn, reported
-// back to the Jetson on DONE so it can distinguish a stall-recovered/failed
-// turn from a clean one instead of both looking identical.
+// Set whenever a stall-escalation branch fires during the current turn,
+// reported back to the Jetson on DONE.
 bool          turnHadStall = false;
 
-// ── FAR-mode "reached" pending verification (see fix note at top of file) ──
-// Set when a FAR-mode poll satisfies COMPASS_TURN_TOL_DEG directly, without
-// the turn ever having slowed into NEAR mode. Motors are stopped immediately
-// but the turn is not finalized until reachedVerifyEndMs passes and a fresh
-// read confirms the heading actually held within tolerance.
+// Reach-verification: set when a poll satisfies compassCurrentTolDeg.
+// Motors stop immediately; finalized only after reachedVerifyEndMs passes
+// and a fresh read confirms the heading actually held. Skipped entirely
+// for coarse turns (tolerance wider than COMPASS_TURN_TOL_DEG) — those
+// don't need to be exact, so there's nothing to verify.
 bool          reachedPendingVerify  = false;
 unsigned long reachedVerifyEndMs    = 0;
 
-// ── Centre-heading correction (CMD:SETCENTRE / CMD:CMOVE) ───────────────────
-// centreHeadingDeg: set by CMD:SETCENTRE (median-of-3, glitch-safe). NAN
-// means no centre correction is configured — CMD:CMOVE falls back to a
-// plain move with no heading check.
-float         centreHeadingDeg     = NAN;
-// CMD:CMOVE drives in CMOVE_SEGMENT_M chunks, checking heading against
-// centreHeadingDeg between each and correcting if it drifted. This replaces
-// the old one-shot pre-move check, since the actual drive is open-loop
-// (I2C disabled during motor movement) and a motor imbalance can drift
-// heading for the whole move otherwise.
-#define CMOVE_SEGMENT_M      0.25f
-bool          isSegmentedMove      = false;
-float         segMoveRemainingM    = 0.0f;
-float         segMoveTargetHeading = NAN;
-// True while the correction CTURN between segments is in progress, so the
-// settle-complete handler knows to recheck and drive the next segment
-// instead of reporting DONE.
-bool          segMoveCorrecting    = false;
+// Accept tolerance for the current CTURN. Defaults to COMPASS_TURN_TOL_DEG;
+// a caller can widen it (CMD:CTURN <deg> <tol>) for turns that don't need
+// to land exactly on target, e.g. scan-dance intermediate splits.
+float         compassCurrentTolDeg = COMPASS_TURN_TOL_DEG;
+
+// Centre heading for CMD:CMOVE steering, set by CMD:SETCENTRE.
+float         centreHeadingDeg = NAN;
+
+// CMD:CMOVE continuous-steering state.
+bool          isCMoveDriving     = false;
+unsigned long cmoveEndTime       = 0;
+unsigned long cmoveLastPollMs    = 0;
+bool          cmoveForward       = true;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  MOTOR PRIMITIVES
@@ -339,17 +263,12 @@ void motorsStop() {
     digitalWrite(PIN_IN3, LOW); digitalWrite(PIN_IN4, LOW);
 }
 
-// Drives a compass turn in a FIXED direction, CORRECTED polarity:
-// dir > 0 must make heading INCREASE (true clockwise) — confirmed backwards
-// before this fix (commanding this branch was making heading DECREASE).
-// dir < 0 makes heading decrease (counter-clockwise).
+// dir > 0 makes heading increase (clockwise), dir < 0 decreases it.
 void driveCompassDir(int8_t dir, uint8_t speed) {
     if (dir > 0) {
-        // CLOCKWISE (heading increases) — swapped from the previous mapping.
         leftMotor (speed, false);
         rightMotor(speed, true);
     } else {
-        // COUNTER-CLOCKWISE (heading decreases) — swapped from the previous mapping.
         leftMotor (speed, true);
         rightMotor(speed, false);
     }
@@ -408,7 +327,9 @@ void recoverI2C() {
     }
 }
 
-// ── Motor noise I2C isolation ──────────────────────────────────────────────
+// I2C is disabled during plain timed MOVE/TURN to avoid motor-EMI bus
+// lockups. CMD:CMOVE's continuous steering needs live heading feedback,
+// so it keeps I2C enabled the whole time instead.
 bool i2cIsDisabled = false;
 
 void disableI2C() {
@@ -440,7 +361,7 @@ void enableI2C() {
     }
 }
 
-// Returns heading in [0, 360). Returns -1.0 on failure. Single-attempt,
+// Returns heading in [0, 360), or -1.0 on failure. Single-attempt,
 // non-blocking — a missed DRDY window just skips this poll cycle.
 float readHeadingDeg() {
     if (!compassReady || i2cIsDisabled) return -1.0f;
@@ -464,6 +385,28 @@ float headingDiffDeg(float from, float to) {
     if (d > 180.0f)   d -= 360.0f;
     if (d <= -180.0f) d += 360.0f;
     return d;
+}
+
+// Reads the compass 3x (25ms apart) and returns the median — rejects lone
+// glitch samples the same way the in-turn plausibility check does.
+float readHeadingMedian(int* goodCountOut = nullptr) {
+    float readings[3] = { -1.0f, -1.0f, -1.0f };
+    int   goodCount    = 0;
+    for (int i = 0; i < 3; i++) {
+        delay(25);
+        float r = readHeadingDeg();
+        if (r >= 0.0f) { readings[goodCount++] = r; }
+    }
+    if (goodCountOut) *goodCountOut = goodCount;
+    if (goodCount == 0) return -1.0f;
+    float med = readings[0];
+    if (goodCount >= 2) {
+        for (int i = 0; i < goodCount - 1; i++)
+            for (int j = i + 1; j < goodCount; j++)
+                if (readings[j] < readings[i]) { float t = readings[i]; readings[i] = readings[j]; readings[j] = t; }
+        med = readings[goodCount / 2];
+    }
+    return med;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -490,13 +433,12 @@ void cancelMotionSilent() {
     compassPulsing   = false;
     compassBraking   = false;
     reachedPendingVerify = false;
-    isSegmentedMove  = false;
-    segMoveCorrecting = false;
+    isCMoveDriving   = false;
 }
 
 void doTurn(float degrees) {
     if (degrees == 0.0f) { sendLine("DONE"); return; }
-    if (isMoving || isSettling || isCompassTurning) cancelMotionSilent();
+    if (isMoving || isSettling || isCompassTurning || isCMoveDriving) cancelMotionSilent();
     turnHadStall = false;   // this is a plain timed turn, not a compass turn
 
     unsigned long durMs = (unsigned long)((fabs(degrees) / TURN_DEG_PER_SEC) * 1000.0f);
@@ -516,36 +458,11 @@ void doTurn(float degrees) {
     isMoving      = true;
 }
 
-// Compass-verified closed-loop turn. Direction is picked HERE, once, from
-// the sign of deltaDeg — deltaDeg > 0 means "heading should increase" and
-// is now correctly mapped via driveCompassDir() (see polarity fix note at
-// top of file). Direction is never changed again for the rest of this turn.
-// Reads the compass 3x (25ms apart) and returns the median — same
-// noise-rejection approach doTurnCompass() uses for its start-heading read.
-// Returns -1.0 if all 3 reads failed.
-float readHeadingMedian(int* goodCountOut = nullptr) {
-    float readings[3] = { -1.0f, -1.0f, -1.0f };
-    int   goodCount    = 0;
-    for (int i = 0; i < 3; i++) {
-        delay(25);
-        float r = readHeadingDeg();
-        if (r >= 0.0f) { readings[goodCount++] = r; }
-    }
-    if (goodCountOut) *goodCountOut = goodCount;
-    if (goodCount == 0) return -1.0f;
-    float med = readings[0];
-    if (goodCount >= 2) {
-        for (int i = 0; i < goodCount - 1; i++)
-            for (int j = i + 1; j < goodCount; j++)
-                if (readings[j] < readings[i]) { float t = readings[i]; readings[i] = readings[j]; readings[j] = t; }
-        med = readings[goodCount / 2];
-    }
-    return med;
-}
-
-void doTurnCompass(float deltaDeg) {
+void doTurnCompass(float deltaDeg, float tolDeg = COMPASS_TURN_TOL_DEG) {
     if (deltaDeg == 0.0f) { sendLine("DONE"); return; }
-    if (isMoving || isSettling || isCompassTurning) cancelMotionSilent();
+    if (isMoving || isSettling || isCompassTurning || isCMoveDriving) cancelMotionSilent();
+
+    compassCurrentTolDeg = tolDeg;
 
     int   goodCount    = 0;
     float startHeading = readHeadingMedian(&goodCount);
@@ -559,7 +476,6 @@ void doTurnCompass(float deltaDeg) {
 
     compassTargetHeading = startHeading + deltaDeg;
     if (isnan(compassTargetHeading) || isinf(compassTargetHeading)) {
-        BLOGln("[CTURN] ERROR: targetHeading is NaN or Inf! Using start heading.");
         compassTargetHeading = startHeading;
     }
     compassTargetHeading = fmod(compassTargetHeading, 360.0f);
@@ -568,9 +484,8 @@ void doTurnCompass(float deltaDeg) {
     BLOGf("[CTURN] start=%.1f  delta=%.1f  target=%.1f  goodReads=%d\r\n",
           startHeading, deltaDeg, compassTargetHeading, goodCount);
 
-    // Direction chosen ONCE here, correctly mapped, held fixed for the whole turn.
-    compassTurnDir = (deltaDeg > 0) ? 1 : -1;
-    currentFarSpeed = SPEED_TURN;   // reset adaptive FAR speed for this turn
+    compassTurnDir  = (deltaDeg > 0) ? 1 : -1;
+    currentFarSpeed = SPEED_TURN;
     driveCompassDir(compassTurnDir, currentFarSpeed);
 
     isCompassTurning     = true;
@@ -581,7 +496,7 @@ void doTurnCompass(float deltaDeg) {
     compassTurnTimeoutMs = millis() + COMPASS_TURN_MAX_MS;
     lastCompassPollMs    = 0;
     compassFailStreak    = 0;
-    lastGoodTurnHeadingDeg = startHeading;   // seed plausibility check for this turn
+    lastGoodTurnHeadingDeg = startHeading;
     far_headingAtLastPoll = NAN;
     far_stallStreak        = 0;
     currentNearSpeed       = COMPASS_NEAR_SPEED;
@@ -591,8 +506,8 @@ void doTurnCompass(float deltaDeg) {
 
 void doMove(float metres) {
     if (metres == 0.0f) { sendLine("DONE"); return; }
-    if (isMoving || isSettling || isCompassTurning) cancelMotionSilent();
-    turnHadStall = false;   // MOVE has no stall detection yet (open-loop) — separate fix needed
+    if (isMoving || isSettling || isCompassTurning || isCMoveDriving) cancelMotionSilent();
+    turnHadStall = false;   // plain MOVE has no stall detection (open-loop)
 
     bool forward = (metres > 0.0f);
     unsigned long durMs = (unsigned long)((fabs(metres) / MOVE_M_PER_SEC) * 1000.0f);
@@ -608,53 +523,34 @@ void doMove(float metres) {
     isMoving      = true;
 }
 
-// Segmented, compass-corrected move: drives the distance in CMOVE_SEGMENT_M
-// chunks. Before each chunk, checks heading against centreHeadingDeg and
-// runs a correction turn if it drifted beyond CENTRE_CORRECT_TOL_DEG. Falls
-// back to a single plain doMove() if no centre is set or compass is down.
-void driveNextMoveSegment() {
-    float segDist = fabs(segMoveRemainingM) > CMOVE_SEGMENT_M
-                        ? CMOVE_SEGMENT_M : fabs(segMoveRemainingM);
-    if (segMoveRemainingM < 0.0f) segDist = -segDist;
-    segMoveRemainingM -= segDist;
-    doMove(segDist);
-}
-
-void startNextMoveSegment() {
-    int   goodCount = 0;
-    float cur       = readHeadingMedian(&goodCount);
-    if (goodCount > 0) {
-        float err = headingDiffDeg(cur, segMoveTargetHeading);
-        if (fabs(err) > CENTRE_CORRECT_TOL_DEG) {
-            BLOGf("[CMOVE] Mid-move drift %.1fdeg -- correcting\r\n", err);
-            segMoveCorrecting = true;
-            doTurnCompass(err);
-            return;
-        }
-    } else {
-        BLOGln("[CMOVE] Heading read failed -- continuing without correction");
-    }
-    segMoveCorrecting = false;
-    driveNextMoveSegment();
-}
-
+// Continuous-steering move: drives the whole distance without stopping,
+// keeping I2C enabled and correcting differential wheel speed toward
+// centreHeadingDeg every CMOVE_STEER_POLL_MS. Falls back to a plain
+// doMove() if no centre is set or the compass is unavailable.
 void doCMove(float metres) {
     if (metres == 0.0f) { sendLine("DONE"); return; }
     if (isnan(centreHeadingDeg) || !compassReady) {
         doMove(metres);
         return;
     }
-    segMoveTargetHeading = centreHeadingDeg;
-    segMoveRemainingM    = metres;
-    isSegmentedMove      = true;
-    segMoveCorrecting    = false;
-    BLOGf("[CMOVE] %.2fm in %.2fm segments, holding %.1fdeg\r\n",
-          metres, CMOVE_SEGMENT_M, segMoveTargetHeading);
-    startNextMoveSegment();
+    if (isMoving || isSettling || isCompassTurning || isCMoveDriving) cancelMotionSilent();
+    turnHadStall = false;
+
+    cmoveForward = (metres > 0.0f);
+    unsigned long durMs = (unsigned long)((fabs(metres) / MOVE_M_PER_SEC) * 1000.0f);
+    BLOGf("[CMOVE] %.2f m  %s  holding %.1fdeg  duration: %lu ms\r\n",
+          fabs(metres), cmoveForward ? "forward" : "backward", centreHeadingDeg, durMs);
+
+    leftMotor (SPEED_MOVE, cmoveForward);
+    rightMotor(SPEED_MOVE, cmoveForward);
+
+    cmoveEndTime    = millis() + durMs;
+    cmoveLastPollMs = 0;
+    isCMoveDriving  = true;
 }
 
 void doStop() {
-    bool wasBusy = isMoving || isSettling || isCompassTurning || isSegmentedMove;
+    bool wasBusy = isMoving || isSettling || isCompassTurning || isCMoveDriving;
     motorsStop();
     isMoving         = false;
     isSettling       = false;
@@ -663,8 +559,7 @@ void doStop() {
     compassPulsing   = false;
     compassBraking   = false;
     reachedPendingVerify = false;
-    isSegmentedMove  = false;
-    segMoveCorrecting = false;
+    isCMoveDriving   = false;
     if (wasBusy) {
         enableI2C();
         sendLine("DONE");
@@ -675,11 +570,9 @@ void doStop() {
 }
 
 // Passive heading query — does NOT move the motors. Replies "HEADING:123.4"
-// on success, or "HEADING:ERR" if all 3 compass reads failed, so the Jetson
-// can note the center heading before a scan-dance and verify the achieved
-// heading after the 3x30deg steps (should be centre+-90).
+// on success, or "HEADING:ERR" if all 3 compass reads failed.
 void doGetHeading() {
-    if (isMoving || isSettling || isCompassTurning) cancelMotionSilent();
+    if (isMoving || isSettling || isCompassTurning || isCMoveDriving) cancelMotionSilent();
     int   goodCount = 0;
     float h         = readHeadingMedian(&goodCount);
     if (goodCount == 0) {
@@ -705,8 +598,15 @@ void handleCommand(String line) {
         float deg = line.substring(9).toFloat();
         doTurn(deg);
     } else if (line.startsWith("CMD:CTURN ")) {
-        float deg = line.substring(10).toFloat();
-        doTurnCompass(deg);
+        String rest = line.substring(10);
+        int sp = rest.indexOf(' ');
+        if (sp == -1) {
+            doTurnCompass(rest.toFloat());
+        } else {
+            float deg = rest.substring(0, sp).toFloat();
+            float tol = rest.substring(sp + 1).toFloat();
+            doTurnCompass(deg, tol);
+        }
     } else if (line.startsWith("CMD:MOVE ")) {
         float dist = line.substring(9).toFloat();
         doMove(dist);
@@ -714,12 +614,9 @@ void handleCommand(String line) {
         float dist = line.substring(10).toFloat();
         doCMove(dist);
     } else if (line == "CMD:SETCENTRE") {
-        // Read the compass now (median-of-3, glitch-safe) and store as the
-        // reference heading for CMD:CMOVE corrections. Always re-reads rather
-        // than trusting any Jetson-supplied value, so a glitch on that side
-        // cannot corrupt the stored centre. Replies HEADING:xx.xx on success
-        // or HEADING:ERR if all 3 reads failed.
-        if (isMoving || isSettling || isCompassTurning) cancelMotionSilent();
+        // Median-of-3, glitch-safe. Always re-reads rather than trusting
+        // any Jetson-supplied value.
+        if (isMoving || isSettling || isCompassTurning || isCMoveDriving) cancelMotionSilent();
         int   goodCount = 0;
         float h         = readHeadingMedian(&goodCount);
         if (goodCount == 0) {
@@ -817,14 +714,53 @@ void loop() {
         enableI2C();
     }
 
-    // ── 1b. Non-blocking compass-turn-complete check (CTURN) ───────────────
+    // ── 1b. Non-blocking CMD:CMOVE continuous-steering check ────────────────
+    if (isCMoveDriving) {
+        unsigned long nowMs = millis();
+        if (nowMs >= cmoveEndTime) {
+            motorsStop();
+            isCMoveDriving = false;
+            isSettling     = true;
+            settleEndTime  = nowMs + STOP_SETTLE_MS;
+        } else if (nowMs - cmoveLastPollMs >= CMOVE_STEER_POLL_MS) {
+            cmoveLastPollMs = nowMs;
+            float h = readHeadingDeg();
+            if (h >= 0.0f && !isnan(lastCompassHeadingDeg)) {
+                float jump = fabs(headingDiffDeg(lastCompassHeadingDeg, h));
+                if (jump > COMPASS_MAX_PLAUSIBLE_JUMP_DEG) h = -1.0f;
+            }
+            if (h >= 0.0f) {
+                lastCompassHeadingDeg = h;
+                float err  = headingDiffDeg(h, centreHeadingDeg);
+                float corr = err * CMOVE_STEER_KP;
+                if (corr >  CMOVE_STEER_MAX_CORR) corr =  CMOVE_STEER_MAX_CORR;
+                if (corr < -CMOVE_STEER_MAX_CORR) corr = -CMOVE_STEER_MAX_CORR;
+                // err > 0 -> heading needs to increase -> speed up left,
+                // slow right (mirrors driveCompassDir's polarity). Flips
+                // for reverse, since wheel torque direction is mirrored.
+                float bias = cmoveForward ? corr : -corr;
+                int leftSpeed  = (int)(SPEED_MOVE + bias);
+                int rightSpeed = (int)(SPEED_MOVE - bias);
+                leftSpeed  = constrain(leftSpeed, 60, 255);
+                rightSpeed = constrain(rightSpeed, 60, 255);
+                leftMotor (leftSpeed,  cmoveForward);
+                rightMotor(rightSpeed, cmoveForward);
+                if (fabs(err) > 1.0f) {
+                    BLOGf("[CMOVE] heading=%.1f target=%.1f err=%.1f "
+                          "L=%d R=%d\r\n", h, centreHeadingDeg, err,
+                          leftSpeed, rightSpeed);
+                }
+            }
+        }
+    }
+
+    // ── 1c. Non-blocking compass-turn-complete check (CTURN) ────────────────
     if (isCompassTurning) {
         unsigned long nowMs = millis();
 
         if (reachedPendingVerify) {
-            // Motors are already stopped. Waiting out the extra coast-settle
-            // window before trusting a "reached" event that arrived directly
-            // from FAR mode (see fix note at top of file).
+            // Motors are already stopped. Wait out the coast-settle window
+            // before trusting a "reached" event, then recheck.
             if (nowMs >= reachedVerifyEndMs) {
                 float h2 = readHeadingDeg();
 
@@ -846,7 +782,6 @@ void loop() {
                           h2, compassTargetHeading, err2);
 
                     if (fabs(err2) <= COMPASS_TURN_TOL_DEG) {
-                        // Genuinely settled within tolerance — finalize.
                         reachedPendingVerify = false;
                         isCompassTurning     = false;
                         compassNearMode      = false;
@@ -858,9 +793,8 @@ void loop() {
                         BLOGf("[CTURN] Verified reached heading=%.1f (target=%.1f)\r\n",
                               h2, compassTargetHeading);
                     } else {
-                        // Coasted past tolerance — resume closed-loop approach
-                        // from where it actually is now instead of reporting
-                        // a false DONE.
+                        // Coasted past tolerance — resume closed-loop from
+                        // where it actually is now.
                         BLOGf("[CTURN] FAR-mode reach was premature (coasted to "
                               "err=%.1f) — resuming approach\r\n", err2);
                         reachedPendingVerify = false;
@@ -881,251 +815,209 @@ void loop() {
                         }
                     }
                 } else {
-                    // Bad read during verify — give it a short additional
-                    // window and try again rather than guessing blind.
                     reachedVerifyEndMs = nowMs + 100UL;
                 }
             }
-            // Skip the normal poll/finalize logic below entirely this pass.
         } else {
-
-        if (compassNearMode && compassPulsing) {
-            if (nowMs >= compassPhaseEndMs) {
-                motorsStop();
-                compassPulsing    = false;
-                compassBraking    = true;
-                compassPhaseEndMs = nowMs + COMPASS_BRAKE_MS;
-            }
-        } else if (compassNearMode && compassBraking) {
-            if (nowMs >= compassPhaseEndMs) {
-                compassBraking = false;
-            }
-        }
-
-        bool readyToCheck = compassNearMode
-                                ? (!compassPulsing && !compassBraking)
-                                : (nowMs - lastCompassPollMs >= COMPASS_POLL_MIN_MS);
-
-        if (readyToCheck) {
-            lastCompassPollMs = nowMs;
-            float h = readHeadingDeg();
-            bool reached = false;
-            bool failed  = false;
-
-            // Reject a reading that implies an impossible jump since the last
-            // ACCEPTED reading (e.g. a lone "0.00" glitch from I2C/EMI noise
-            // while the boat was actually still near its previous heading).
-            // Without this check one bad-but-in-range sample makes the
-            // firmware believe it's ~100+ deg further from target than it
-            // really is, and FAR mode will happily spin that whole extra
-            // distance chasing a phantom error.
-            if (h >= 0.0f && !isnan(lastGoodTurnHeadingDeg)) {
-                float jump = fabs(headingDiffDeg(lastGoodTurnHeadingDeg, h));
-                if (jump > COMPASS_MAX_PLAUSIBLE_JUMP_DEG) {
-                    BLOGf("[CTURN] Implausible jump %.1fdeg (last-good=%.1f "
-                          "new=%.1f) — rejecting as glitch, treating as bad read\r\n",
-                          jump, lastGoodTurnHeadingDeg, h);
-                    h = -1.0f;   // fall through to the failed-read branch below
+            if (compassNearMode && compassPulsing) {
+                if (nowMs >= compassPhaseEndMs) {
+                    motorsStop();
+                    compassPulsing    = false;
+                    compassBraking    = true;
+                    compassPhaseEndMs = nowMs + COMPASS_BRAKE_MS;
+                }
+            } else if (compassNearMode && compassBraking) {
+                if (nowMs >= compassPhaseEndMs) {
+                    compassBraking = false;
                 }
             }
-            float err = 0.0f;
 
-            if (h >= 0.0f) {
-                compassFailStreak = 0;
-                lastCompassHeadingDeg  = h;
-                lastGoodTurnHeadingDeg = h;
-                err = headingDiffDeg(h, compassTargetHeading);
-                BLOGf("[CTURN] heading=%.1f  target=%.1f  err=%.1f  mode=%s\r\n",
-                      h, compassTargetHeading, err, compassNearMode ? "NEAR" : "FAR");
+            bool readyToCheck = compassNearMode
+                                    ? (!compassPulsing && !compassBraking)
+                                    : (nowMs - lastCompassPollMs >= COMPASS_POLL_MIN_MS);
 
-                if (fabs(err) <= COMPASS_TURN_TOL_DEG) {
-                    reached = true;
-                } else if (!compassNearMode && fabs(err) <= COMPASS_NEAR_THRESHOLD_DEG) {
-                    // Crossing into NEAR mode: stop completely, settle, THEN
-                    // pulse. compassTurnDir is NEVER recomputed from err.
-                    motorsStop();
-                    compassNearMode           = true;
-                    compassBraking            = true;
-                    compassPhaseEndMs         = nowMs + COMPASS_BRAKE_MS;
-                    compassPulseDurMs         = COMPASS_PULSE_MS;   // reset adaptive duration
-                    compassHeadingBeforePulse = h;
-                    compassNearDirPrev        = 0;
-                    compassOscillationStreak  = 0;
-                } else if (compassNearMode) {
-                    int8_t nearDir = (err > 0.0f) ? 1 : -1;
+            if (readyToCheck) {
+                lastCompassPollMs = nowMs;
+                float h = readHeadingDeg();
+                bool  reached = false;
+                bool  failed  = false;
+                float err     = 0.0f;
 
-                    // Recompute direction from the LIVE sign of err (not the
-                    // stale compassTurnDir) — FAR mode's full-speed spin can
-                    // carry the hull past the target on momentum before the
-                    // stop takes effect, and once that happens the correct
-                    // pulse direction is the OPPOSITE of the original turn
-                    // direction. This is safe now that driveCompassDir()'s
-                    // polarity itself is fixed; it was only unsafe under the
-                    // old backwards-polarity bug.
-                    bool dirFlipped = (compassNearDirPrev != 0 && nearDir != compassNearDirPrev);
-                    compassOscillationStreak = dirFlipped ? (compassOscillationStreak + 1) : 0;
+                if (h >= 0.0f && !isnan(lastGoodTurnHeadingDeg)) {
+                    float jump = fabs(headingDiffDeg(lastGoodTurnHeadingDeg, h));
+                    if (jump > COMPASS_MAX_PLAUSIBLE_JUMP_DEG) {
+                        BLOGf("[CTURN] Implausible jump %.1fdeg (last-good=%.1f "
+                              "new=%.1f) — rejecting as glitch, treating as bad read\r\n",
+                              jump, lastGoodTurnHeadingDeg, h);
+                        h = -1.0f;
+                    }
+                }
 
-                    float progress = fabs(headingDiffDeg(compassHeadingBeforePulse, h));
-                    if (compassOscillationStreak >= COMPASS_OSCILLATION_LIMIT) {
-                        // Direction keeps flipping — the hull has enough
-                        // momentum that pulses are overshooting the target
-                        // BOTH ways (hunting), not just being soaked up by
-                        // drag. Growing the pulse further would amplify the
-                        // overshoot, not fix it — force a short, gentle tap
-                        // instead so it can settle rather than hunt forever.
-                        compassPulseDurMs = COMPASS_PULSE_MS_FINE;
-                        BLOGf("[CTURN] NEAR oscillating (streak=%u) — forcing "
-                              "fine pulse %lums\r\n",
-                              (unsigned)compassOscillationStreak, compassPulseDurMs);
-                    } else if (compassPulseDurMs > 0) {
-                        // Check whether the LAST pulse actually made progress.
-                        // If the hull barely moved (water drag/slosh soaking
-                        // up the pulse), lengthen the next pulse (capped); if
-                        // it made good progress, drop back to the base
-                        // duration so we don't overshoot once drag improves.
-                        if (progress < COMPASS_PULSE_PROGRESS_MIN) {
-                            if (compassPulseDurMs < COMPASS_PULSE_MS_MAX) {
-                                compassPulseDurMs = min(compassPulseDurMs + 100UL, COMPASS_PULSE_MS_MAX);
-                                BLOGf("[CTURN] NEAR pulse stalled (progress=%.1f) — "
-                                      "lengthening to %lums\r\n", progress, compassPulseDurMs);
-                                near_stallAtCapStreak = 0;
-                            } else {
-                                // Already at max pulse duration and still not
-                                // moving — the bump is too strong for
-                                // COMPASS_NEAR_SPEED. Ramp PWM instead of
-                                // repeating useless maxed-out pulses forever.
-                                near_stallAtCapStreak++;
-                                turnHadStall = true;
-                                if (near_stallAtCapStreak >= NEAR_STALL_AT_CAP_LIMIT) {
-                                    if (currentNearSpeed < NEAR_SPEED_MAX) {
-                                        currentNearSpeed = min((int)currentNearSpeed + NEAR_SPEED_STEP, (int)NEAR_SPEED_MAX);
-                                        BLOGf("[CTURN] NEAR stalled at max pulse duration — "
-                                              "ramping speed to %u\r\n", (unsigned)currentNearSpeed);
-                                    } else {
-                                        BLOGln("[CTURN] NEAR stalled at max speed+duration — rocking free");
-                                        driveCompassDir((int8_t)(-nearDir), currentNearSpeed);
-                                        delay(ROCK_FREE_MS);
-                                    }
+                if (h >= 0.0f) {
+                    compassFailStreak = 0;
+                    lastCompassHeadingDeg  = h;
+                    lastGoodTurnHeadingDeg = h;
+                    err = headingDiffDeg(h, compassTargetHeading);
+                    BLOGf("[CTURN] heading=%.1f  target=%.1f  err=%.1f  mode=%s\r\n",
+                          h, compassTargetHeading, err, compassNearMode ? "NEAR" : "FAR");
+
+                    if (fabs(err) <= compassCurrentTolDeg) {
+                        reached = true;
+                    } else if (!compassNearMode && fabs(err) <= COMPASS_NEAR_THRESHOLD_DEG) {
+                        motorsStop();
+                        compassNearMode           = true;
+                        compassBraking            = true;
+                        compassPhaseEndMs         = nowMs + COMPASS_BRAKE_MS;
+                        compassPulseDurMs         = COMPASS_PULSE_MS;
+                        compassHeadingBeforePulse = h;
+                        compassNearDirPrev        = 0;
+                        compassOscillationStreak  = 0;
+                    } else if (compassNearMode) {
+                        int8_t nearDir = (err > 0.0f) ? 1 : -1;
+
+                        bool dirFlipped = (compassNearDirPrev != 0 && nearDir != compassNearDirPrev);
+                        compassOscillationStreak = dirFlipped ? (compassOscillationStreak + 1) : 0;
+
+                        float progress = fabs(headingDiffDeg(compassHeadingBeforePulse, h));
+                        if (compassOscillationStreak >= COMPASS_OSCILLATION_LIMIT) {
+                            compassPulseDurMs = COMPASS_PULSE_MS_FINE;
+                            BLOGf("[CTURN] NEAR oscillating (streak=%u) — forcing "
+                                  "fine pulse %lums\r\n",
+                                  (unsigned)compassOscillationStreak, compassPulseDurMs);
+                        } else if (compassPulseDurMs > 0) {
+                            if (progress < COMPASS_PULSE_PROGRESS_MIN) {
+                                if (compassPulseDurMs < COMPASS_PULSE_MS_MAX) {
+                                    compassPulseDurMs = min(compassPulseDurMs + 100UL, COMPASS_PULSE_MS_MAX);
+                                    BLOGf("[CTURN] NEAR pulse stalled (progress=%.1f) — "
+                                          "lengthening to %lums\r\n", progress, compassPulseDurMs);
                                     near_stallAtCapStreak = 0;
+                                } else {
+                                    near_stallAtCapStreak++;
+                                    turnHadStall = true;
+                                    if (near_stallAtCapStreak >= NEAR_STALL_AT_CAP_LIMIT) {
+                                        if (currentNearSpeed < NEAR_SPEED_MAX) {
+                                            currentNearSpeed = min((int)currentNearSpeed + NEAR_SPEED_STEP, (int)NEAR_SPEED_MAX);
+                                            BLOGf("[CTURN] NEAR stalled at max pulse duration — "
+                                                  "ramping speed to %u\r\n", (unsigned)currentNearSpeed);
+                                        } else {
+                                            BLOGln("[CTURN] NEAR stalled at max speed+duration — rocking free");
+                                            driveCompassDir((int8_t)(-nearDir), currentNearSpeed);
+                                            delay(ROCK_FREE_MS);
+                                        }
+                                        near_stallAtCapStreak = 0;
+                                    }
                                 }
+                            } else {
+                                compassPulseDurMs     = COMPASS_PULSE_MS;
+                                currentNearSpeed       = COMPASS_NEAR_SPEED;
+                                near_stallAtCapStreak  = 0;
                             }
                         } else {
-                            compassPulseDurMs     = COMPASS_PULSE_MS;
-                            currentNearSpeed       = COMPASS_NEAR_SPEED;   // decay back to base once progress resumes
-                            near_stallAtCapStreak  = 0;
+                            compassPulseDurMs = COMPASS_PULSE_MS;
+                        }
+
+                        compassNearDirPrev        = nearDir;
+                        compassHeadingBeforePulse = h;
+                        driveCompassDir(nearDir, currentNearSpeed);
+                        compassPulsing    = true;
+                        compassPhaseEndMs = nowMs + compassPulseDurMs;
+                    } else {
+                        if (!isnan(far_headingAtLastPoll)) {
+                            float progress = fabs(headingDiffDeg(far_headingAtLastPoll, h));
+                            if (progress < FAR_STALL_PROGRESS_MIN_DEG) {
+                                far_stallStreak++;
+                                BLOGf("[CTURN] FAR stall check: progress=%.1fdeg  streak=%u/%u\r\n",
+                                      progress, (unsigned)far_stallStreak, (unsigned)FAR_STALL_STREAK_LIMIT);
+                                if (far_stallStreak >= FAR_STALL_STREAK_LIMIT) {
+                                    turnHadStall = true;
+                                    if (currentFarSpeed < FAR_SPEED_MAX) {
+                                        currentFarSpeed = min((int)currentFarSpeed + FAR_SPEED_STEP, (int)FAR_SPEED_MAX);
+                                        BLOGf("[CTURN] FAR stalled — ramping speed to %u\r\n",
+                                              (unsigned)currentFarSpeed);
+                                        driveCompassDir(compassTurnDir, currentFarSpeed);
+                                    } else {
+                                        BLOGln("[CTURN] FAR stalled at max PWM — rocking free");
+                                        driveCompassDir((int8_t)(-compassTurnDir), currentFarSpeed);
+                                        delay(ROCK_FREE_MS);
+                                        driveCompassDir(compassTurnDir, currentFarSpeed);
+                                    }
+                                    far_stallStreak = 0;
+                                }
+                            } else {
+                                far_stallStreak = 0;
+                                if (currentFarSpeed > SPEED_TURN) {
+                                    currentFarSpeed = max((int)SPEED_TURN, (int)currentFarSpeed - FAR_SPEED_STEP);
+                                    driveCompassDir(compassTurnDir, currentFarSpeed);
+                                }
+                            }
+                        }
+                        far_headingAtLastPoll = h;
+                    }
+                } else {
+                    compassFailStreak++;
+                    BLOGf("[CTURN] bad read streak=%u/%u\r\n",
+                          (unsigned)compassFailStreak,
+                          (unsigned)COMPASS_FAIL_ABORT_STREAK);
+                    failed = (compassFailStreak >= COMPASS_FAIL_ABORT_STREAK);
+                }
+
+                if (reached) {
+                    bool isCoarse = compassCurrentTolDeg > COMPASS_TURN_TOL_DEG + 0.01f;
+                    if (isCoarse) {
+                        motorsStop();
+                        isCompassTurning = false;
+                        compassNearMode  = false;
+                        compassPulsing   = false;
+                        compassBraking   = false;
+                        isSettling       = true;
+                        settleEndTime    = nowMs + STOP_SETTLE_MS;
+                        compassConsecutiveTurnFails = 0;
+                        BLOGf("[CTURN] Reached (coarse, tol=%.1f) heading=%.1f "
+                              "(target=%.1f)\r\n", compassCurrentTolDeg, h, compassTargetHeading);
+                    } else {
+                        motorsStop();
+                        reachedPendingVerify = true;
+                        reachedVerifyEndMs   = nowMs + COMPASS_REACHED_VERIFY_MS;
+                        BLOGf("[CTURN] Tolerance hit (err=%.1f mode=%s) — verifying "
+                              "after %lums coast-settle before accepting\r\n",
+                              err, compassNearMode ? "NEAR" : "FAR",
+                              (unsigned long)COMPASS_REACHED_VERIFY_MS);
+                    }
+                } else if (nowMs >= compassTurnTimeoutMs || failed) {
+                    motorsStop();
+                    isCompassTurning = false;
+                    compassNearMode  = false;
+                    compassPulsing   = false;
+                    compassBraking   = false;
+                    isSettling       = true;
+                    settleEndTime    = nowMs + STOP_SETTLE_MS;
+
+                    if (failed) {
+                        compassConsecutiveTurnFails++;
+                        BLOGf("[CTURN] Compass read failures: %u/%u consecutive bad turns\r\n",
+                              (unsigned)compassConsecutiveTurnFails,
+                              (unsigned)COMPASS_DISABLE_AFTER_N_FAILS);
+                        recoverI2C();
+                        if (compassConsecutiveTurnFails >= COMPASS_DISABLE_AFTER_N_FAILS) {
+                            compassReady = false;
+                            BLOGln("[Compass] Disabling compass for remainder of session "
+                                   "- CMD:CTURN will use timed fallback. Check NEO3 wiring "
+                                   "(SDA/SCL/GND/3.3V) and I2C address.");
                         }
                     } else {
-                        compassPulseDurMs = COMPASS_PULSE_MS;
+                        BLOGf("[CTURN] Timeout (%.1fs) waiting for target=%.1f last=%.1f, stopping\r\n",
+                              COMPASS_TURN_MAX_MS / 1000.0f, compassTargetHeading, h);
                     }
-
-                    compassNearDirPrev        = nearDir;
-                    compassHeadingBeforePulse = h;
-                    driveCompassDir(nearDir, currentNearSpeed);
-                    compassPulsing    = true;
-                    compassPhaseEndMs = nowMs + compassPulseDurMs;
-                } else {
-                    // Still FAR mode — check whether the hull is actually
-                    // making progress, not just spinning against a bump.
-                    // A stall here is invisible to the glitch-rejection and
-                    // bad-read paths above, since the compass reading stays
-                    // perfectly valid (a real heading, just not changing).
-                    if (!isnan(far_headingAtLastPoll)) {
-                        float progress = fabs(headingDiffDeg(far_headingAtLastPoll, h));
-                        if (progress < FAR_STALL_PROGRESS_MIN_DEG) {
-                            far_stallStreak++;
-                            BLOGf("[CTURN] FAR stall check: progress=%.1fdeg  streak=%u/%u\r\n",
-                                  progress, (unsigned)far_stallStreak, (unsigned)FAR_STALL_STREAK_LIMIT);
-                            if (far_stallStreak >= FAR_STALL_STREAK_LIMIT) {
-                                turnHadStall = true;
-                                if (currentFarSpeed < FAR_SPEED_MAX) {
-                                    currentFarSpeed = min((int)currentFarSpeed + FAR_SPEED_STEP, (int)FAR_SPEED_MAX);
-                                    BLOGf("[CTURN] FAR stalled — ramping speed to %u\r\n",
-                                          (unsigned)currentFarSpeed);
-                                    driveCompassDir(compassTurnDir, currentFarSpeed);
-                                } else {
-                                    BLOGln("[CTURN] FAR stalled at max PWM — rocking free");
-                                    driveCompassDir((int8_t)(-compassTurnDir), currentFarSpeed);
-                                    delay(ROCK_FREE_MS);
-                                    driveCompassDir(compassTurnDir, currentFarSpeed);
-                                }
-                                far_stallStreak = 0;
-                            }
-                        } else {
-                            far_stallStreak = 0;
-                            // Progress resumed (bump cleared) — decay speed
-                            // back toward the calibrated base rather than
-                            // staying pinned at the ramped-up value forever.
-                            if (currentFarSpeed > SPEED_TURN) {
-                                currentFarSpeed = max((int)SPEED_TURN, (int)currentFarSpeed - FAR_SPEED_STEP);
-                                driveCompassDir(compassTurnDir, currentFarSpeed);
-                            }
-                        }
-                    }
-                    far_headingAtLastPoll = h;
-                }
-            } else {
-                compassFailStreak++;
-                BLOGf("[CTURN] bad read streak=%u/%u\r\n",
-                      (unsigned)compassFailStreak,
-                      (unsigned)COMPASS_FAIL_ABORT_STREAK);
-                failed = (compassFailStreak >= COMPASS_FAIL_ABORT_STREAK);
-            }
-
-            if (reached) {
-                // Stop now, but don't finalize until a fresh read after an
-                // extra coast-settle window confirms the heading actually
-                // held (see fix note at top of file).
-                motorsStop();
-                reachedPendingVerify = true;
-                reachedVerifyEndMs   = nowMs + COMPASS_REACHED_VERIFY_MS;
-                BLOGf("[CTURN] Tolerance hit (err=%.1f mode=%s) — verifying "
-                      "after %lums coast-settle before accepting\r\n",
-                      err, compassNearMode ? "NEAR" : "FAR",
-                      (unsigned long)COMPASS_REACHED_VERIFY_MS);
-            } else if (nowMs >= compassTurnTimeoutMs || failed) {
-                motorsStop();
-                isCompassTurning = false;
-                compassNearMode  = false;
-                compassPulsing   = false;
-                compassBraking   = false;
-                isSettling       = true;
-                settleEndTime    = nowMs + STOP_SETTLE_MS;
-
-                if (failed) {
-                    compassConsecutiveTurnFails++;
-                    BLOGf("[CTURN] Compass read failures: %u/%u consecutive bad turns\r\n",
-                          (unsigned)compassConsecutiveTurnFails,
-                          (unsigned)COMPASS_DISABLE_AFTER_N_FAILS);
-                    recoverI2C();
-                    if (compassConsecutiveTurnFails >= COMPASS_DISABLE_AFTER_N_FAILS) {
-                        compassReady = false;
-                        BLOGln("[Compass] Disabling compass for remainder of session "
-                               "- CMD:CTURN will use timed fallback. Check NEO3 wiring "
-                               "(SDA/SCL/GND/3.3V) and I2C address.");
-                    }
-                } else {
-                    BLOGf("[CTURN] Timeout (%.1fs) waiting for target=%.1f last=%.1f, stopping\r\n",
-                          COMPASS_TURN_MAX_MS / 1000.0f, compassTargetHeading, h);
                 }
             }
-        }
         }
     }
 
     // ── 2. Non-blocking settle-complete check ──────────────────────────────
     if (isSettling && millis() >= settleEndTime) {
         isSettling = false;
-        // Take one fresh read right now rather than trusting whatever
-        // lastCompassHeadingDeg was at the moment "reached"/"timeout" fired —
-        // the hull can keep coasting on momentum for a bit after the motors
-        // stop (especially after a NEAR-mode timeout), so the true settled
-        // heading can differ from what was true a settle-period ago.
         float freshH = readHeadingDeg();
         if (freshH >= 0.0f && !isnan(lastCompassHeadingDeg)) {
-            // Same plausibility check used for in-turn polls — the first
-            // read right after enableI2C()'s re-setup is frequently a
-            // glitchy 0.00 (I2C not fully settled yet). Without this check
-            // that glitch gets reported to the Jetson as a real heading.
             float jump = fabs(headingDiffDeg(lastCompassHeadingDeg, freshH));
             if (jump > COMPASS_MAX_PLAUSIBLE_JUMP_DEG) {
                 BLOGf("[SETTLE] Implausible final read (last=%.1f new=%.1f "
@@ -1135,24 +1027,6 @@ void loop() {
             }
         }
         if (freshH >= 0.0f) lastCompassHeadingDeg = freshH;
-
-        // If a segmented CMD:CMOVE is in progress, continue it instead of
-        // sending DONE: either resume driving after a mid-move correction
-        // turn just settled, or start the next segment (which rechecks
-        // heading and corrects again if needed).
-        if (isSegmentedMove) {
-            if (segMoveCorrecting) {
-                segMoveCorrecting = false;
-                startNextMoveSegment();
-                return;
-            }
-            if (fabs(segMoveRemainingM) >= 0.001f) {
-                startNextMoveSegment();
-                return;
-            }
-            isSegmentedMove = false;
-            // Fall through — final segment done, report DONE below.
-        }
 
         if (!isnan(lastCompassHeadingDeg)) {
             char doneBuf[56];
