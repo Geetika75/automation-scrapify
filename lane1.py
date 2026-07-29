@@ -71,7 +71,7 @@ RTSP_LEFT  = ("rtsp://admin:Scrapify%40123@192.168.1.102:554/"
 RTSP_RIGHT = ("rtsp://admin:Scrapify%40123@192.168.1.103:554/"
               "cam/realmonitor?channel=1&subtype=1&unicast=true&proto=Onvif")
 
-CALIB_FILE   = "stereo_calib_cl11.npz"
+CALIB_FILE   = "stereo_calib_cl14.npz"
 YOLO_MODEL   = "yolo11x.pt"
 BOTTLE_CLASS = 39
 CONF_THRESH  = 0.25
@@ -167,7 +167,7 @@ MAX_DEPTH_WAIT_TRIES = 3
 #       — the compass is intentionally NOT used there.
 # NOTE: SCAN_STEP_DEG (30.0, defined above) is reused for the Scan Dance's
 #       30deg outward splits — no separate constant needed.
-SEARCH_LANE_LENGTH_M   = 1.5    # m   — length of each lane before a lane shift
+SEARCH_LANE_LENGTH_M   = 1.0    # m   — length of each lane before a lane shift
 STEP_DISTANCE_M        = 0.5    # m   — forward step between scan-dance stops
 SEARCH_LANE_SHIFT_M    = 1.0    # m   — sideways shift between lanes
 SEARCH_TOTAL_LANES     = 3      # lanes — 2 shifts of SEARCH_LANE_SHIFT_M -> 3.0m width
@@ -968,7 +968,7 @@ def dist_color(dist_m):
 
 def draw_detections(frame, results, depth, cam_label, is_main_view=True,
                     track_history=None, roi_poly=None,
-                    active_id=None, sorted_targets=None, fx=395.34):
+                    active_id=None, sorted_targets=None, fx=378.9):
     out   = frame.copy()
     H_f   = out.shape[0]
     W_f   = out.shape[1]
