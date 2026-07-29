@@ -96,7 +96,7 @@ float MOVE_M_PER_SEC   = 0.1429;
 //  COMPASS (IST8310 via CUAV NEO 3) CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
 #define COMPASS_TURN_TOL_DEG          3.0f
-#define COMPASS_TURN_MAX_MS           10000UL // headroom for the near-mode pulse phase
+#define COMPASS_TURN_MAX_MS           15000UL // headroom for the near-mode pulse phase
 #define COMPASS_POLL_MIN_MS           80UL
 #define COMPASS_FAIL_ABORT_STREAK     15
 #define COMPASS_DISABLE_AFTER_N_FAILS 10
@@ -104,7 +104,7 @@ float MOVE_M_PER_SEC   = 0.1429;
 // NEAR-target approach: short stop-then-pulse cycles once within this
 // threshold, replacing the earlier reactive direction-flip.
 #define COMPASS_NEAR_THRESHOLD_DEG    20.0f
-#define COMPASS_NEAR_SPEED            165
+#define COMPASS_NEAR_SPEED            200
 #define COMPASS_PULSE_MS              90UL
 #define COMPASS_PULSE_MS_MAX          400UL  // cap so a stalled pulse can't run away
 #define COMPASS_PULSE_PROGRESS_MIN    1.0f   // deg — below this, count as "stalled" vs drag
@@ -136,7 +136,7 @@ float MOVE_M_PER_SEC   = 0.1429;
 #define FAR_SPEED_MAX                 255
 // NEAR mode: once pulse duration is already maxed and still not making
 // progress, ramp COMPASS_NEAR_SPEED instead of repeating useless pulses.
-#define NEAR_STALL_AT_CAP_LIMIT       3
+#define NEAR_STALL_AT_CAP_LIMIT       2
 #define NEAR_SPEED_STEP               15
 #define NEAR_SPEED_MAX                255
 // Brief reverse pulse when fully stuck at max PWM in either mode — the one
@@ -145,8 +145,8 @@ float MOVE_M_PER_SEC   = 0.1429;
 
 // CMD:CMOVE continuous steering.
 #define CMOVE_STEER_POLL_MS   200UL   // heading recheck interval while driving
-#define CMOVE_STEER_KP        3.0f    // deg error -> PWM differential
-#define CMOVE_STEER_MAX_CORR  50.0f   // cap so one side never stalls or reverses
+#define CMOVE_STEER_KP        6.0f    // deg error -> PWM differential
+#define CMOVE_STEER_MAX_CORR  100.0f   // cap so one side never stalls or reverses
 
 IST8310       ist8310;
 bool          compassReady = false;
