@@ -1465,10 +1465,27 @@ def main():
                       f"{COLLECT_MAX_DIST_M:.2f}m collect range — ignoring")
                 _last_ignore_print_time = now_loop
         else:
-            # No valid-depth target yet — raw_hold_active is allowed to
-            # hold briefly so depth can resolve; the check above will re-run
-            # once depth appears and can still reject it.
-            _within_collect_range = True
+            # No valid-depth target this frame. Normally hold briefly so a
+            # newly-appeared object's depth can resolve — but if a recent
+            # sighting of this detection already showed it's out of collect
+            # range, don't grant a fresh hold. Without this, a persistently
+            # visible far-away object re-triggers a multi-second
+            # pause-for-collection cycle on every scan-dance step, even
+            # though we already know it isn't reachable.
+            _recent_ts, _recent_dist = None, None
+            if _post_scan_best_target is not None:
+                _recent_ts   = _post_scan_best_target['ts']
+                _recent_dist = _post_scan_best_target['dist']
+            if (_anon_target is not None
+                    and (_recent_ts is None or _anon_target['ts'] > _recent_ts)):
+                _recent_ts   = _anon_target['ts']
+                _recent_dist = _anon_target['dist']
+            _recent_known_far = (
+                _recent_ts is not None
+                and (now_loop - _recent_ts) < 2.0
+                and _recent_dist > COLLECT_MAX_DIST_M
+            )
+            _within_collect_range = not _recent_known_far
 
         if sorted_targets:
             depth_fail_since = 0.0
@@ -1944,8 +1961,31 @@ def main():
                                  _post_scan_settle_until, _post_scan_restart_ok_after, \
                                  search_paused_for_nav, _nav_total_turn_deg
 
+                        # After a false-alarm pause (detection turned out to be
+                        # transient or out of range), interrupts are ignored
+                        # until this time — otherwise the same persistent,
+                        # depth-unresolved background detection retriggers
+                        # another expensive pause on the very next step.
+                        _interrupt_guard_until = 0.0
+
+                        def _interrupt_active():
+                            return (nav_interrupt_event.is_set()
+                                    and time.time() >= _interrupt_guard_until)
+
+                        class _GuardedInterrupt:
+                            """Duck-types threading.Event's is_set() for
+                            ESPCommander's interrupt_event param, but honors
+                            the false-alarm cooldown -- passed to ESP calls
+                            so a persistent unresolved-depth detection can't
+                            also interrupt the physical turn/move mid-guard."""
+                            def is_set(self):
+                                return _interrupt_active()
+
+                        _guarded_interrupt = _GuardedInterrupt()
+
                         def _sp_pause_for_collection(label):
-                            nonlocal search_pattern_busy, search_paused_for_nav, _post_scan_settle_until
+                            nonlocal search_pattern_busy, search_paused_for_nav, \
+                                     _post_scan_settle_until, _interrupt_guard_until
                             print(f"  [search] {label} — target detected, pausing search pattern for collection...")
                             esp.send_stop()
                             search_paused_for_nav = True
@@ -1954,10 +1994,13 @@ def main():
                             # Clear settle guard so nav can start immediately
                             _post_scan_settle_until = time.time()
 
-                            # Wait for nav to start (i.e., nav_busy = True)
+                            # Wait for nav to start (i.e., nav_busy = True).
+                            # A real collection dispatches navigate() within a
+                            # frame or two once depth confirms range, so 1.0s
+                            # is generous margin -- no need for the old 3.0s.
                             start_wait = time.time()
                             nav_started = False
-                            while time.time() - start_wait < 3.0:
+                            while time.time() - start_wait < 1.0:
                                 with _nav_lock:
                                     if nav_busy:
                                         nav_started = True
@@ -1975,7 +2018,8 @@ def main():
                                 time.sleep(POST_SCAN_RESTART_BLOCK_S)
                             else:
                                 print("  [search] Navigation did not start (transient detection?), resuming search...")
-                                time.sleep(1.0)
+                                time.sleep(0.3)
+                                _interrupt_guard_until = time.time() + 1.5
 
                             # Undo any navigation turns that occurred, restoring
                             # absolute heading for the search pattern. Compass-
