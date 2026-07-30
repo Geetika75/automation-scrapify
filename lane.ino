@@ -118,6 +118,14 @@ float MOVE_M_PER_SEC   = 0.1429;
 // even at full FAR speed. A bigger implied jump (e.g. an I2C/EMI glitch)
 // is almost certainly bad data, not real motion.
 #define COMPASS_MAX_PLAUSIBLE_JUMP_DEG 60.0f
+// NEAR-mode pulses are short (90-400ms) at reduced speed — real heading
+// movement between polls is only a few degrees, nowhere near the 60deg
+// FAR-mode ceiling above. Without a tighter cap here, a 10-30deg I2C/EMI
+// glitch sails through unrejected during NEAR mode, gets treated as the
+// real heading, and corrupts both the direction chosen for the next pulse
+// AND the baseline every future poll compares against — nothing re-anchors
+// to truth, so the error compounds turn after turn instead of converging.
+#define COMPASS_MAX_PLAUSIBLE_JUMP_NEAR_DEG 15.0f
 
 // Any "reached" event is provisional: stop immediately, then wait this
 // long and recheck before finalizing, since momentum (FAR or NEAR mode)
@@ -738,7 +746,7 @@ void loop() {
                 // err > 0 -> heading needs to increase -> speed up left,
                 // slow right (mirrors driveCompassDir's polarity). Flips
                 // for reverse, since wheel torque direction is mirrored.
-                float bias = cmoveForward ? corr : -corr;
+                float bias = cmoveForward ? -corr : corr;
                 int leftSpeed  = (int)(SPEED_MOVE + bias);
                 int rightSpeed = (int)(SPEED_MOVE - bias);
                 leftSpeed  = constrain(leftSpeed, 60, 255);
@@ -845,10 +853,12 @@ void loop() {
 
                 if (h >= 0.0f && !isnan(lastGoodTurnHeadingDeg)) {
                     float jump = fabs(headingDiffDeg(lastGoodTurnHeadingDeg, h));
-                    if (jump > COMPASS_MAX_PLAUSIBLE_JUMP_DEG) {
+                    float maxJump = compassNearMode ? COMPASS_MAX_PLAUSIBLE_JUMP_NEAR_DEG
+                                                     : COMPASS_MAX_PLAUSIBLE_JUMP_DEG;
+                    if (jump > maxJump) {
                         BLOGf("[CTURN] Implausible jump %.1fdeg (last-good=%.1f "
-                              "new=%.1f) — rejecting as glitch, treating as bad read\r\n",
-                              jump, lastGoodTurnHeadingDeg, h);
+                              "new=%.1f max=%.1f) — rejecting as glitch, treating as bad read\r\n",
+                              jump, lastGoodTurnHeadingDeg, h, maxJump);
                         h = -1.0f;
                     }
                 }
