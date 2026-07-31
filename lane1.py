@@ -185,6 +185,12 @@ SCAN_STEP_COARSE_TOL_DEG = 12.0  # deg — widened accept tolerance for the firs
                                  # splits per side; skips the ESP's reach-verify coast-settle
                                  # since these don't need to be exact — the final split to
                                  # the edge (an absolute-target turn) corrects any drift
+SCAN_EDGE_TOL_DEG = 5.0  # deg — tolerance for the edge (centre+-90) turn itself. Looser than
+                          # the ESP's tight default (3deg): the edge heading only needs to be
+                          # roughly right for scan coverage, unlike return-to-centre which
+                          # becomes the lane's actual reference and stays at the tight default.
+                          # Cuts how many NEAR-mode pulse cycles a marginal turn needs to
+                          # finish within COMPASS_TURN_MAX_MS.
 
 
 def heading_diff_deg(frm, to):
@@ -1465,27 +1471,10 @@ def main():
                       f"{COLLECT_MAX_DIST_M:.2f}m collect range — ignoring")
                 _last_ignore_print_time = now_loop
         else:
-            # No valid-depth target this frame. Normally hold briefly so a
-            # newly-appeared object's depth can resolve — but if a recent
-            # sighting of this detection already showed it's out of collect
-            # range, don't grant a fresh hold. Without this, a persistently
-            # visible far-away object re-triggers a multi-second
-            # pause-for-collection cycle on every scan-dance step, even
-            # though we already know it isn't reachable.
-            _recent_ts, _recent_dist = None, None
-            if _post_scan_best_target is not None:
-                _recent_ts   = _post_scan_best_target['ts']
-                _recent_dist = _post_scan_best_target['dist']
-            if (_anon_target is not None
-                    and (_recent_ts is None or _anon_target['ts'] > _recent_ts)):
-                _recent_ts   = _anon_target['ts']
-                _recent_dist = _anon_target['dist']
-            _recent_known_far = (
-                _recent_ts is not None
-                and (now_loop - _recent_ts) < 2.0
-                and _recent_dist > COLLECT_MAX_DIST_M
-            )
-            _within_collect_range = not _recent_known_far
+            # No valid-depth target yet — raw_hold_active is allowed to
+            # hold briefly so depth can resolve; the check above will re-run
+            # once depth appears and can still reject it.
+            _within_collect_range = True
 
         if sorted_targets:
             depth_fail_since = 0.0
@@ -1961,31 +1950,8 @@ def main():
                                  _post_scan_settle_until, _post_scan_restart_ok_after, \
                                  search_paused_for_nav, _nav_total_turn_deg
 
-                        # After a false-alarm pause (detection turned out to be
-                        # transient or out of range), interrupts are ignored
-                        # until this time — otherwise the same persistent,
-                        # depth-unresolved background detection retriggers
-                        # another expensive pause on the very next step.
-                        _interrupt_guard_until = 0.0
-
-                        def _interrupt_active():
-                            return (nav_interrupt_event.is_set()
-                                    and time.time() >= _interrupt_guard_until)
-
-                        class _GuardedInterrupt:
-                            """Duck-types threading.Event's is_set() for
-                            ESPCommander's interrupt_event param, but honors
-                            the false-alarm cooldown -- passed to ESP calls
-                            so a persistent unresolved-depth detection can't
-                            also interrupt the physical turn/move mid-guard."""
-                            def is_set(self):
-                                return _interrupt_active()
-
-                        _guarded_interrupt = _GuardedInterrupt()
-
                         def _sp_pause_for_collection(label):
-                            nonlocal search_pattern_busy, search_paused_for_nav, \
-                                     _post_scan_settle_until, _interrupt_guard_until
+                            nonlocal search_pattern_busy, search_paused_for_nav, _post_scan_settle_until
                             print(f"  [search] {label} — target detected, pausing search pattern for collection...")
                             esp.send_stop()
                             search_paused_for_nav = True
@@ -1994,13 +1960,10 @@ def main():
                             # Clear settle guard so nav can start immediately
                             _post_scan_settle_until = time.time()
 
-                            # Wait for nav to start (i.e., nav_busy = True).
-                            # A real collection dispatches navigate() within a
-                            # frame or two once depth confirms range, so 1.0s
-                            # is generous margin -- no need for the old 3.0s.
+                            # Wait for nav to start (i.e., nav_busy = True)
                             start_wait = time.time()
                             nav_started = False
-                            while time.time() - start_wait < 1.0:
+                            while time.time() - start_wait < 3.0:
                                 with _nav_lock:
                                     if nav_busy:
                                         nav_started = True
@@ -2014,12 +1977,30 @@ def main():
                                         if not nav_busy:
                                             break
                                     time.sleep(0.1)
+                                # Debounce: a second, independently-dispatched
+                                # navigate() (e.g. the main loop's cached
+                                # pending-target path) can start within
+                                # milliseconds of this one finishing. Recheck
+                                # after a short grace window before declaring
+                                # collection done — if nav_busy is true again,
+                                # a new episode has started; go back to waiting
+                                # for IT instead of resuming the search pattern
+                                # out from under it.
+                                time.sleep(0.4)
+                                with _nav_lock:
+                                    _still_busy = nav_busy
+                                while _still_busy:
+                                    with _nav_lock:
+                                        if not nav_busy:
+                                            break
+                                    time.sleep(0.1)
+                                    with _nav_lock:
+                                        _still_busy = nav_busy
                                 print("  [search] Collection completed, waiting for recovery settle...")
                                 time.sleep(POST_SCAN_RESTART_BLOCK_S)
                             else:
                                 print("  [search] Navigation did not start (transient detection?), resuming search...")
-                                time.sleep(0.3)
-                                _interrupt_guard_until = time.time() + 1.5
+                                time.sleep(1.0)
 
                             # Undo any navigation turns that occurred, restoring
                             # absolute heading for the search pattern. Compass-
@@ -2101,7 +2082,7 @@ def main():
                                 print(f"  [search] {label}: completed via bump/stall "
                                       f"recovery on the ESP (see its serial log)")
                             _sp_wait(label)
-                        def _sp_turn_to(target_heading, label):
+                        def _sp_turn_to(target_heading, label, tol_deg=None):
                             """Like _sp_turn, but targets a KNOWN ABSOLUTE heading (the center
                             noted at the start of a scan-dance) rather than a relative delta
                             from wherever the boat currently is. The dance's return-to-center
@@ -2110,7 +2091,13 @@ def main():
                             during settle), turning -90 from the DRIFTED heading compounds
                             that drift instead of correcting it, so the boat never actually
                             returns to the true noted center. Returns False (caller should
-                            fall back to a relative turn) if heading can't be read."""
+                            fall back to a relative turn) if heading can't be read.
+
+                            tol_deg, if given, widens the ESP's accept tolerance for this
+                            turn — used for the edge steps (where being off by a few degrees
+                            doesn't matter) so NEAR-mode doesn't need as many pulse cycles to
+                            finish. Omit for the tight default (used for return-to-centre,
+                            where the heading becomes the lane's actual reference)."""
                             absolute_target = target_heading
                             while True:
                                 cur = esp.get_heading()
@@ -2121,7 +2108,7 @@ def main():
                                     _sp_pause_for_collection(f"{label} (pre-turn)")
                                     continue
                                 completed = esp.send_turn_compass_interruptible(
-                                    remaining_delta, nav_interrupt_event)
+                                    remaining_delta, nav_interrupt_event, tol_deg=tol_deg)
                                 if not completed or nav_interrupt_event.is_set():
                                     _sp_pause_for_collection(f"{label} (interrupted)")
                                     continue
@@ -2132,6 +2119,7 @@ def main():
                             _sp_wait(label)
                             return True
                             
+
                         def _sp_move(dist_m, label, centre_corrected=True):
                             """Forward/backward move. The ESP's CMD:CMOVE
                             automatically corrects heading drift before moving
@@ -2202,7 +2190,8 @@ def main():
                             _sp_turn(+SCAN_STEP_DEG, f"{label} right-step-2/3",
                                      tol_deg=SCAN_STEP_COARSE_TOL_DEG)
                             if center_heading is None or not _sp_turn_to(
-                                    (center_heading + SCAN_EDGE_DEG) % 360.0, f"{label} right-edge"):
+                                    (center_heading + SCAN_EDGE_DEG) % 360.0, f"{label} right-edge",
+                                    tol_deg=SCAN_EDGE_TOL_DEG):
                                 _sp_turn(+SCAN_STEP_DEG, f"{label} right-step-3/3")
                             if center_heading is None or not _sp_turn_to(center_heading, f"{label} return-to-center-from-right"):
                                 _sp_turn(-SCAN_EDGE_DEG, f"{label} return-to-center-from-right")
@@ -2214,7 +2203,8 @@ def main():
                             _sp_turn(-SCAN_STEP_DEG, f"{label} left-step-2/3",
                                      tol_deg=SCAN_STEP_COARSE_TOL_DEG)
                             if center_heading is None or not _sp_turn_to(
-                                    (center_heading - SCAN_EDGE_DEG) % 360.0, f"{label} left-edge"):
+                                    (center_heading - SCAN_EDGE_DEG) % 360.0, f"{label} left-edge",
+                                    tol_deg=SCAN_EDGE_TOL_DEG):
                                 _sp_turn(-SCAN_STEP_DEG, f"{label} left-step-3/3")
                             if center_heading is None or not _sp_turn_to(center_heading, f"{label} return-to-center-from-left"):
                                 _sp_turn(+SCAN_EDGE_DEG, f"{label} return-to-center-from-left")

@@ -96,7 +96,12 @@ float MOVE_M_PER_SEC   = 0.1429;
 //  COMPASS (IST8310 via CUAV NEO 3) CONFIG
 // ═══════════════════════════════════════════════════════════════════════════
 #define COMPASS_TURN_TOL_DEG          3.0f
-#define COMPASS_TURN_MAX_MS           10000UL // headroom for the near-mode pulse phase
+#define COMPASS_TURN_MAX_MS           15000UL // was 10000 — marginal NEAR-mode
+                                                // convergence (several stalled/
+                                                // lengthened pulse cycles) can
+                                                // genuinely need more than 10s;
+                                                // was seen timing out at err=3.1
+                                                // against tol=3.0, one pulse short
 #define COMPASS_POLL_MIN_MS           80UL
 #define COMPASS_FAIL_ABORT_STREAK     15
 #define COMPASS_DISABLE_AFTER_N_FAILS 10
