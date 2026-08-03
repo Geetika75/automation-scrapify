@@ -1951,7 +1951,7 @@ def main():
                                  search_paused_for_nav, _nav_total_turn_deg
 
                         def _sp_pause_for_collection(label):
-                            nonlocal search_pattern_busy, search_paused_for_nav, _post_scan_settle_until
+                            nonlocal search_pattern_busy, search_paused_for_nav, _post_scan_settle_until, _nav_total_turn_deg
                             print(f"  [search] {label} — target detected, pausing search pattern for collection...")
                             esp.send_stop()
                             search_paused_for_nav = True
@@ -1996,20 +1996,26 @@ def main():
                                     time.sleep(0.1)
                                     with _nav_lock:
                                         _still_busy = nav_busy
+                                # Undo any navigation turns that occurred, restoring
+                                # absolute heading for the search pattern. Compass-
+                                # verified so the restored heading is exact regardless
+                                # of accumulated timed-turn drift from navigate()'s turns.
+                                # Only reachable when nav_started — a transient
+                                # detection that never dispatched navigate() never
+                                # turned the boat, so there's nothing to undo. Reset
+                                # to 0.0 right after so a later transient pause can't
+                                # replay this same correction again.
+                                if _nav_total_turn_deg != 0.0:
+                                    print(f"  [search] Undoing navigation turn of {_nav_total_turn_deg:.1f}deg to restore search heading")
+                                    esp.send_turn_compass(-_nav_total_turn_deg)
+                                    _nav_total_turn_deg = 0.0
+                                    _sp_wait("restore-heading")
+
                                 print("  [search] Collection completed, waiting for recovery settle...")
                                 time.sleep(POST_SCAN_RESTART_BLOCK_S)
                             else:
                                 print("  [search] Navigation did not start (transient detection?), resuming search...")
                                 time.sleep(1.0)
-
-                            # Undo any navigation turns that occurred, restoring
-                            # absolute heading for the search pattern. Compass-
-                            # verified so the restored heading is exact regardless
-                            # of accumulated timed-turn drift from navigate()'s turns.
-                            if _nav_total_turn_deg != 0.0:
-                                print(f"  [search] Undoing navigation turn of {_nav_total_turn_deg:.1f}deg to restore search heading")
-                                esp.send_turn_compass(-_nav_total_turn_deg)
-                                _sp_wait("restore-heading")
 
                             search_pattern_busy = True
                             search_paused_for_nav = False
